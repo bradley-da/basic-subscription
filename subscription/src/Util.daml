@@ -1,0 +1,40 @@
+module Util where
+
+import DA.Foldable (forA_)
+
+import Splice.AmuletRules
+import Splice.Round
+
+data BillingContext = BillingContext with
+    now : Time 
+    amuletRulesCid : ContractId AmuletRules
+    openRoundCid : ContractId OpenMiningRound
+    openRound : OpenMiningRound
+    featuredTransferContext : AppTransferContext 
+    unfeaturedTransferContext : AppTransferContext                                
+    feeComputationContext : TransferContext 
+  deriving (Eq, Show)
+
+fetchAndValidateBillingContext : Party -> Party -> AppTransferContext -> Update BillingContext
+fetchAndValidateBillingContext dso provider featuredTransferContext = do
+    openRound <- exercise openRoundCid OpenMiningRound_Fetch with p = provider
+    forA_ featuredTransferContext.featuredAppRight $ \featuredAppRightCid -> do
+      featuredAppRight <- fetch featuredAppRightCid
+      require "DSO party on feature app right matches" (featuredAppRight.dso == dso)
+      require "Provider of featured app right matches" (featuredAppRight.provider == provider)
+    now <- getTime
+    pure BillingContext with
+      now
+      openRound
+      openRoundCid
+      amuletRulesCid
+      featuredTransferContext
+      unfeaturedTransferContext = featuredTransferContext with featuredAppRight = None
+      feeComputationContext = amuletTransferContext openRoundCid None
+  where
+    openRoundCid = featuredTransferContext.openMiningRound
+    amuletRulesCid = featuredTransferContext.amuletRules
+
+require : CanAssert m => Text -> Bool -> m ()
+require msg invariant =
+  assertMsg ("The requirement '" <> msg <> "' was not met.") invariant

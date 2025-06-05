@@ -1,0 +1,171 @@
+module Subscription where
+
+import DA.Time
+
+import Splice.Amulet
+import Splice.AmuletRules
+import Splice.Expiry
+import qualified Splice.Fees as Fees
+
+import Util
+
+data Subscription_TopUp_Result = Subscription_TopUp_Result with
+    newSubscription : ContractId Subscription 
+  deriving (Eq, Show)
+
+data Subscription_Bill_Result = Subscription_Bill_Result with
+    newSubscription : ContractId Subscription 
+  deriving (Eq, Show)
+
+template SubscriptionOffer 
+  with
+    provider : Party
+    subscriber : Party
+    dso : Party
+    description : Text
+    requiredDepositAmountCc : Decimal
+    depositDuration : RelTime
+  where
+    signatory provider
+    observer subscriber
+
+    choice SubscriptionOffer_Accept : ContractId Subscription
+      with
+        appContext : AppTransferContext 
+        subscriberFunds : [ContractId Amulet] 
+      controller subscriber
+      do
+        now <- getTime
+        context <- fetchAndValidateBillingContext dso provider appContext
+
+        let lockedCoinOutput = TransferOutput with
+                  receiver = subscriber
+                  receiverFeeRatio = 0.0
+                  amount = requiredDepositAmountCc
+                  lock = Some $ TimeLock with
+                    holders = [subscriber, provider]
+                    expiresAt = now `addRelTime` depositDuration
+                    optContext = Some "Simple Subscription"
+
+        let transfer = Transfer with
+                  sender = subscriber
+                  provider = provider
+                  inputs = map InputAmulet $ subscriberFunds
+                  outputs = [lockedCoinOutput]
+                  beneficiaries = None
+        result <- exerciseAppTransfer context.featuredTransferContext transfer
+        let [TransferResultLockedAmulet lockedCoinCid] = result.createdAmulets
+
+        subscription <- create Subscription with 
+          provider = provider
+          subscriber = subscriber
+          dso = dso
+          description = description
+          depositCid = lockedCoinCid
+          currentDepositAmountCC = requiredDepositAmountCc
+          requiredDepositAmountCc = requiredDepositAmountCc
+          depositDuration = depositDuration
+
+        pure subscription
+
+template Subscription
+  with
+    provider : Party
+    subscriber : Party
+    dso : Party
+    description : Text
+    depositCid : ContractId LockedAmulet
+    currentDepositAmountCC : Decimal
+    requiredDepositAmountCc : Decimal
+    depositDuration : RelTime
+  where
+    signatory provider, subscriber
+    
+    choice Subscription_TopUp : Subscription_TopUp_Result
+      with
+        subscriberFunds : [ContractId Amulet] 
+        appContext : AppTransferContext 
+      controller subscriber
+      do
+        now <- getTime
+        context <- fetchAndValidateBillingContext dso provider appContext
+
+        unlockResult <- exercise depositCid LockedAmulet_Unlock with
+              openRoundCid = context.openRoundCid
+
+        let depositAmulet = unlockResult.amuletSum.amulet
+
+        let lockedCoinOutput = TransferOutput with
+                  receiver = subscriber
+                  receiverFeeRatio = 0.0
+                  amount = requiredDepositAmountCc
+                  lock = Some $ TimeLock with
+                    holders = [subscriber, provider]
+                    expiresAt = now `addRelTime` depositDuration
+                    optContext = Some "Simple Subscription"
+        let transfer = Transfer with
+                  sender = subscriber
+                  provider = provider 
+                  -- ^ This field in the transfer is the party that will earn app rewards and requires
+                  -- a featured app right for featured transfers
+                  inputs = map InputAmulet $ subscriberFunds ++ [depositAmulet]
+                  outputs = [lockedCoinOutput]
+                  beneficiaries = None
+        
+        result <- exerciseAppTransfer context.featuredTransferContext transfer
+        let [TransferResultLockedAmulet lockedCoinCid] = result.createdAmulets
+        deposit <- fetch lockedCoinCid
+        let depositAmountCC = Fees.actualAmount context.openRound.round deposit.amulet.amount
+
+        newSubscription <- create this with 
+          depositCid = lockedCoinCid
+          currentDepositAmountCC = depositAmountCC
+
+        pure $ Subscription_TopUp_Result newSubscription
+
+    choice Subscription_Bill : Subscription_Bill_Result
+      with 
+        billAmountCC : Decimal
+        appContext : AppTransferContext
+      controller provider 
+      do
+        now <- getTime
+        context <- fetchAndValidateBillingContext dso provider appContext
+
+        unlockResult <- exercise depositCid LockedAmulet_Unlock with
+              openRoundCid = context.openRoundCid
+
+        let depositAmulet = unlockResult.amuletSum.amulet
+        unlockedDeposit <- fetch depositAmulet
+        let actualDepositAmountCc = Fees.actualAmount context.openRound.round unlockedDeposit.amount 
+        
+        let billOutput = TransferOutput with
+                  receiver = provider
+                  receiverFeeRatio = 1.0
+                  amount = billAmountCC
+                  lock = None
+        let lockedCoinOutput = TransferOutput with
+                  receiver = subscriber
+                  receiverFeeRatio = 1.0
+                  amount = actualDepositAmountCc - billAmountCC
+                  lock = Some $ TimeLock with
+                    holders = [subscriber, provider]
+                    expiresAt = now `addRelTime` depositDuration
+                    optContext = Some "Simple Subscription"
+        let transfer = Transfer with
+                  sender = subscriber
+                  provider = provider
+                  inputs = [InputAmulet depositAmulet]
+                  outputs = [lockedCoinOutput, billOutput]
+                  beneficiaries = None
+                  
+        result <- exerciseAppTransfer context.featuredTransferContext transfer
+        let [TransferResultLockedAmulet lockedCoinCid, _] = result.createdAmulets
+        deposit <- fetch lockedCoinCid
+        let depositAmountCC = Fees.actualAmount context.openRound.round deposit.amulet.amount
+
+        newSubscription <- create this with 
+          depositCid = lockedCoinCid
+          currentDepositAmountCC = depositAmountCC
+
+        pure $ Subscription_Bill_Result newSubscription
